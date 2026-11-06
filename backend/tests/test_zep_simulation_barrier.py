@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import errno
 import json
 
 import pytest
@@ -77,6 +78,72 @@ def test_platform_completion_does_not_publish_terminal_success_before_barrier(
 
     assert state.twitter_completed is True
     assert state.runner_status == RunnerStatus.RUNNING
+
+
+def test_monitor_recovers_from_failed_progress_save_and_finishes_with_env_alive(
+    monkeypatch, tmp_path
+):
+    simulation_id = "sim-monitor-recovery"
+    sim_dir = tmp_path / simulation_id
+    actions_dir = sim_dir / "twitter"
+    actions_dir.mkdir(parents=True)
+    actions_file = actions_dir / "actions.jsonl"
+    actions_file.write_text('{"event_type":"round_end","round":1}\n', encoding="utf-8")
+    state = SimulationRunState(
+        simulation_id=simulation_id,
+        runner_status=RunnerStatus.RUNNING,
+        total_rounds=2,
+        twitter_running=True,
+    )
+
+    class InterviewProcess:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            assert state.runner_status == RunnerStatus.COMPLETED
+            self.returncode = 0
+
+    process = InterviewProcess()
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, "_run_states", {simulation_id: state})
+    monkeypatch.setattr(SimulationRunner, "_processes", {simulation_id: process})
+    monkeypatch.setattr(SimulationRunner, "_graph_memory_enabled", {simulation_id: True})
+    save_run_state = SimulationRunner._save_run_state
+    write_fails = True
+
+    def save_state(_cls, value):
+        nonlocal write_fails
+        if write_fails:
+            write_fails = False
+            raise OSError(errno.EINVAL, "progress file temporarily unavailable")
+        save_run_state(value)
+
+    def finish_rounds(_interval):
+        with actions_file.open("a", encoding="utf-8") as actions:
+            actions.write('{"event_type":"round_end","round":2}\n')
+            actions.write('{"event_type":"simulation_end"}\n')
+        (sim_dir / "env_status.json").write_text('{"status":"alive"}', encoding="utf-8")
+
+    def drain_graph(_cls, _simulation_id):
+        assert state.runner_status == RunnerStatus.STOPPING
+        assert state.twitter_completed
+
+    monkeypatch.setattr(SimulationRunner, "_save_run_state", classmethod(save_state))
+    monkeypatch.setattr(SimulationRunner, "_sync_simulation_status", lambda *_args: None)
+    monkeypatch.setattr(runner_module.time, "sleep", finish_rounds)
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager, "stop_updater", classmethod(drain_graph)
+    )
+
+    SimulationRunner._monitor_simulation(simulation_id)
+
+    saved = json.loads((sim_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert saved["runner_status"] == "completed"
+    assert saved["current_round"] == 2
+    assert simulation_id not in SimulationRunner._processes
 
 
 def test_manual_stop_timeout_leaves_monitor_owned_state_stopping(monkeypatch):

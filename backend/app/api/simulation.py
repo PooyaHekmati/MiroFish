@@ -1605,6 +1605,11 @@ def start_simulation():
             if is_prepared:
                 run_state = SimulationRunner.get_run_state(simulation_id)
                 updater = ZepGraphMemoryManager.get_updater(simulation_id)
+                completed_with_live_env = (
+                    run_state is not None
+                    and run_state.runner_status == RunnerStatus.COMPLETED
+                    and simulation_id in SimulationRunner.get_running_simulations()
+                )
                 needs_finalization = bool(
                     run_state
                     and run_state.runner_status in {
@@ -1651,6 +1656,9 @@ def start_simulation():
                             "success": False,
                             "error": "Previous simulation did not reach STOPPED",
                         }), 409
+
+                if completed_with_live_env:
+                    SimulationRunner.stop_simulation(simulation_id)
 
                 # 如果是强制模式，清理运行日志
                 if force:
@@ -1820,7 +1828,7 @@ def stop_simulation():
         # 更新模拟状态
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
-        if state:
+        if state and run_state.runner_status == RunnerStatus.STOPPED:
             state.status = SimulationStatus.STOPPED
             state.error = None
             manager._save_simulation_state(state)
